@@ -117,9 +117,10 @@ def divide(a: float, b: float) -> float:
                 assert len(debug_data["debug_result"]) > 0
                 assert len(debug_data["retrieved_chunks"]) > 0
 
-                # Clean up repo
+                # Clean up repo and verify ChromaDB deletion
                 del_res = await client.delete(f"/api/repositories/{repo_id}")
                 assert del_res.status_code == 200
+                assert rag_service.get_chunk_count(repo_id) == 0
 
             finally:
                 shutil.rmtree(temp_dir, ignore_errors=True)

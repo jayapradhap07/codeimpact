@@ -106,6 +106,15 @@ export const api = {
       method: "DELETE",
     }),
 
+  deleteRepositoryFile: (repoId: number, filePath: string) =>
+    request<{ status: string; repo_id: number; file_path: string }>(
+      `/api/repositories/${repoId}/file?path=${encodeURIComponent(filePath)}`,
+      {
+        method: "DELETE",
+      }
+    ),
+
+
   explainCode: (data: { repo_id: number; file_path?: string; code?: string; question?: string }) =>
     request<ExplainResponse>("/api/explain", {
       method: "POST",

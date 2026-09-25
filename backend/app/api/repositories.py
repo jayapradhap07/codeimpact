@@ -58,6 +58,18 @@ async def get_repository_file(repo_id: int, path: str = Query(..., description="
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 
+@router.delete("/{repo_id}/file")
+async def delete_repository_file(repo_id: int, path: str = Query(..., description="Relative file path")):
+    """Delete a specific file in the repository and remove its embeddings from ChromaDB."""
+    try:
+        result = await repository_service.delete_file(repo_id, path)
+        return result
+    except FileNotFoundError as fe:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(fe))
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
 @router.delete("/{repo_id}")
 async def delete_repository(repo_id: int):
     """Delete repository, local files, and ChromaDB collection."""
@@ -66,3 +78,16 @@ async def delete_repository(repo_id: int):
         return {"status": "deleted", "id": repo_id}
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@router.post("/cleanup")
+async def cleanup_orphaned_repositories():
+    """Clean any orphaned repository folders in data/repos that do not exist in the database."""
+    try:
+        removed = await repository_service.cleanup_orphans()
+        return {"status": "success", "removed_folders": removed}
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+

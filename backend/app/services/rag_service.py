@@ -154,8 +154,31 @@ class RAGService:
         collection_name = self._get_collection_name(repo_id)
         try:
             self.client.delete_collection(name=collection_name)
-        except Exception:
-            pass
+            logger.info(f"Successfully deleted ChromaDB collection '{collection_name}' for repository {repo_id}.")
+        except Exception as e:
+            logger.info(f"ChromaDB collection '{collection_name}' not found or already removed: {e}")
+
+    def delete_file_chunks(self, repo_id: int, file_path: str) -> None:
+        """Delete specific file chunks from the repository's ChromaDB collection."""
+        collection_name = self._get_collection_name(repo_id)
+        norm_path = file_path.lstrip("/\\").replace("\\", "/")
+        alt_path = file_path.lstrip("/\\").replace("/", "\\")
+        try:
+            collection = self.client.get_collection(
+                name=collection_name,
+                embedding_function=self.ef,
+            )
+            collection.delete(where={"file_path": norm_path})
+            if alt_path != norm_path:
+                try:
+                    collection.delete(where={"file_path": alt_path})
+                except Exception:
+                    pass
+            logger.info(f"Deleted ChromaDB chunks for file '{norm_path}' in repo {repo_id}.")
+        except Exception as e:
+            logger.warning(f"Failed to delete ChromaDB chunks for file '{file_path}': {e}")
+
+
 
     @staticmethod
     def build_context_prompt(retrieved_chunks: List[Dict[str, Any]]) -> str:

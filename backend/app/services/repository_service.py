@@ -2,9 +2,10 @@
 
 import asyncio
 import os
+import stat
 import shutil
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, Union
 from loguru import logger
 from sqlalchemy import select
 
@@ -13,6 +14,28 @@ from app.db.database import async_session
 from app.db.models import Repository
 from app.services.code_processor import code_processor
 from app.services.rag_service import rag_service
+
+
+def remove_readonly(func, path, exc_info):
+    """Clear readonly bit and retry file deletion (needed on Windows for git objects)."""
+    try:
+        os.chmod(path, stat.S_IWRITE)
+        func(path)
+    except Exception as e:
+        logger.warning(f"Could not remove {path}: {e}")
+
+
+def safe_rmtree(target_path: Union[str, Path]) -> None:
+    """Safely and completely delete a directory tree, handling Windows read-only git files."""
+    if not target_path:
+        return
+    p = Path(target_path)
+    if not p.exists():
+        return
+    try:
+        shutil.rmtree(str(p), onerror=remove_readonly)
+    except Exception as e:
+        logger.warning(f"Failed to remove directory {p}: {e}")
 
 
 class RepositoryService:
@@ -42,7 +65,8 @@ class RepositoryService:
     async def clone_repository(self, repo_url: str, destination: Path) -> None:
         """Clone a Git repository into destination directory."""
         if destination.exists():
-            shutil.rmtree(destination, ignore_errors=True)
+            safe_rmtree(destination)
+
         destination.mkdir(parents=True, exist_ok=True)
 
         logger.info(f"Cloning {repo_url} into {destination}...")
@@ -249,17 +273,96 @@ class RepositoryService:
             with open(target_file, "r", encoding="utf-8", errors="ignore") as f:
                 return f.read()
 
+    async def delete_file(self, repo_id: int, file_path: str) -> Dict[str, Any]:
+        """Delete a file from the repository disk and simultaneously purge its ChromaDB embeddings."""
+        normalized_path = file_path.lstrip("/\\").replace("\\", "/")
+
+        async with async_session() as db:
+            repo = await db.get(Repository, repo_id)
+            if not repo or not repo.local_path:
+                raise FileNotFoundError(f"Repository {repo_id} not found.")
+
+            target_file = Path(repo.local_path) / normalized_path
+            if not target_file.exists() or not target_file.is_file():
+                raise FileNotFoundError(f"File '{normalized_path}' not found in repository.")
+
+            # 1. Delete physical file from disk
+            target_file.unlink()
+
+            # 2. Rescan remaining repository files and update database stats
+            all_files, supported_files, languages = self.scan_repository(Path(repo.local_path))
+            repo.file_count = len(all_files)
+            repo.supported_files_count = len(supported_files)
+            repo.total_lines = sum(f["line_count"] for f in supported_files)
+            repo.languages = languages
+            await db.commit()
+
+        # 3. Simultaneously delete vector chunks from ChromaDB
+        rag_service.delete_file_chunks(repo_id, normalized_path)
+
+        return {
+            "status": "deleted",
+            "repo_id": repo_id,
+            "file_path": normalized_path,
+        }
+
     async def delete_repository(self, repo_id: int) -> None:
-        """Delete repository files, database entry, and ChromaDB collection."""
+        """Delete repository files from disk, remove SQLite database entry, and delete ChromaDB collection."""
         async with async_session() as db:
             repo = await db.get(Repository, repo_id)
             if repo:
-                if repo.local_path and Path(repo.local_path).exists():
-                    shutil.rmtree(repo.local_path, ignore_errors=True)
+                repo_name = repo.name
+                local_path = repo.local_path
+
+                # 1. Delete by repo.local_path
+                if local_path:
+                    safe_rmtree(local_path)
+
+                # 2. Delete by ID folder in repos storage path
+                id_dir = Path(settings.repo_storage_path) / str(repo_id)
+                safe_rmtree(id_dir)
+
+                # 3. Delete by repo name folder in repos storage path if present
+                if repo_name:
+                    name_dir = Path(settings.repo_storage_path) / repo_name
+                    safe_rmtree(name_dir)
+
                 await db.delete(repo)
                 await db.commit()
+            else:
+                # If record was not found in DB, still clean any leftover folders on disk
+                id_dir = Path(settings.repo_storage_path) / str(repo_id)
+                safe_rmtree(id_dir)
 
+        # 4. Simultaneously delete vector collection and all embeddings in ChromaDB
         rag_service.delete_repository_collection(repo_id)
+
+    async def cleanup_orphans(self) -> List[str]:
+        """Clean any folders in data/repos that do not belong to active database repositories."""
+        async with async_session() as db:
+            res = await db.execute(select(Repository))
+            active_repos = res.scalars().all()
+            active_ids = {str(r.id) for r in active_repos}
+            active_names = {r.name for r in active_repos if r.name}
+            active_paths = {str(Path(r.local_path).resolve()) for r in active_repos if r.local_path}
+
+        repos_root = Path(settings.repo_storage_path)
+        removed: List[str] = []
+        if repos_root.exists():
+            for item in repos_root.iterdir():
+                if item.is_dir():
+                    is_active = (
+                        item.name in active_ids
+                        or item.name in active_names
+                        or str(item.resolve()) in active_paths
+                    )
+                    if not is_active:
+                        logger.info(f"Cleaning orphaned repository folder: {item}")
+                        safe_rmtree(item)
+                        removed.append(item.name)
+        return removed
 
 
 repository_service = RepositoryService()
+
+
