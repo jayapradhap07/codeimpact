@@ -27,6 +27,7 @@ dist-ssr/
 
 # CodeImpact Database & Generated Data
 backend/data/
+chroma_data/
 *.sqlite
 *.sqlite3
 *.db
