@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Node / Frontend
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# Environment Variables & Secrets
+.env
+*.env
+!.env.example
+
+# CodeImpact Database & Generated Data
+backend/data/
+*.sqlite
+*.sqlite3
+*.db
+
+# IDE / System
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
