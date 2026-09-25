@@ -1,8 +1,9 @@
 """RAG Service for ChromaDB indexing, similarity retrieval, and context building."""
 
-import uuid
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import chromadb
+from loguru import logger
+
 from app.config import settings
 from app.services.embedding_service import embedding_service
 
@@ -11,112 +12,168 @@ class RAGService:
     """Manages vector storage and similarity retrieval using ChromaDB."""
 
     def __init__(self):
-        # Using ChromaDB client with persistent or in-memory storage
-        try:
-            self.client = chromadb.PersistentClient(path=settings.CHROMA_PERSIST_DIR)
-        except Exception:
-            self.client = chromadb.Client()
+        settings.ensure_directories()
+        self.client = chromadb.PersistentClient(path=settings.chroma_persist_dir)
         self.ef = embedding_service.get_embedding_function()
 
-    def index_and_retrieve(
-        self,
-        chunks: List[Dict[str, Any]],
-        query: str,
-        top_k: int = 4,
-    ) -> List[Dict[str, Any]]:
+    def _get_collection_name(self, repo_id: int) -> str:
+        """Standard collection name for a given repository ID."""
+        return f"repo_{repo_id}"
+
+    def index_repository_chunks(self, repo_id: int, chunks: List[Dict[str, Any]]) -> int:
         """
-        Indexes code chunks into ChromaDB and retrieves the top-k most relevant chunks.
-        
-        Returns a list of retrieved chunks with content, line numbers, and metadata.
+        Store chunks + embeddings + metadata into ChromaDB collection for the repository.
         """
         if not chunks:
-            return []
+            return 0
 
-        # If only 1 chunk exists (small code), return it directly
-        if len(chunks) == 1:
-            return chunks
+        collection_name = self._get_collection_name(repo_id)
 
-        # Create a unique ephemeral collection for this query analysis
-        collection_id = f"analysis_{uuid.uuid4().hex[:12]}"
+        # Delete existing collection if re-indexing
+        try:
+            self.client.delete_collection(name=collection_name)
+        except Exception:
+            pass
+
         collection = self.client.create_collection(
-            name=collection_id,
+            name=collection_name,
             embedding_function=self.ef,
             metadata={"hnsw:space": "cosine"},
         )
 
-        try:
-            # Prepare documents, metadatas, and ids for ChromaDB
-            ids = [chunk["chunk_id"] for chunk in chunks]
-            documents = [chunk["content"] for chunk in chunks]
+        # ChromaDB batch size
+        batch_size = 200
+        total_chunks = len(chunks)
+
+        for i in range(0, total_chunks, batch_size):
+            batch = chunks[i : i + batch_size]
+            ids = [f"{repo_id}_{c['file_path']}_{c['start_line']}_{c['end_line']}_{idx}" for idx, c in enumerate(batch, start=i)]
+            documents = [c["content"] for c in batch]
             metadatas = [
                 {
-                    "start_line": chunk["start_line"],
-                    "end_line": chunk["end_line"],
-                    "language": chunk.get("language", "python"),
-                    "source": chunk.get("metadata", {}).get("source", "user_code"),
+                    "repository": str(c.get("repository", "")),
+                    "file_path": str(c.get("file_path", "")),
+                    "programming_language": str(c.get("programming_language", "text")),
+                    "start_line": int(c.get("start_line", 1)),
+                    "end_line": int(c.get("end_line", 1)),
                 }
-                for chunk in chunks
+                for c in batch
             ]
 
-            # Add to ChromaDB collection
             collection.add(
                 ids=ids,
                 documents=documents,
                 metadatas=metadatas,
             )
 
-            # Query ChromaDB
-            n_results = min(top_k, len(chunks))
+        logger.info(f"Indexed {total_chunks} chunks into ChromaDB collection '{collection_name}'.")
+        return total_chunks
+
+    def retrieve_relevant_chunks(
+        self,
+        repo_id: int,
+        query: str,
+        file_path: Optional[str] = None,
+        top_k: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """
+        Retrieve top-k relevant code chunks from ChromaDB for a given repository and query.
+        Optionally filters by a specific file_path.
+        """
+        collection_name = self._get_collection_name(repo_id)
+
+        try:
+            collection = self.client.get_collection(
+                name=collection_name,
+                embedding_function=self.ef,
+            )
+        except Exception as e:
+            logger.warning(f"Collection {collection_name} not found: {e}")
+            return []
+
+        count = collection.count()
+        if count == 0:
+            return []
+
+        n_results = min(top_k, count)
+        where_clause = None
+        if file_path and file_path.strip():
+            where_clause = {"file_path": file_path.strip()}
+
+        try:
+            results = collection.query(
+                query_texts=[query],
+                n_results=n_results,
+                where=where_clause,
+            )
+        except Exception as e:
+            # If where filter yielded no results or errored, fallback to search without filter
+            logger.warning(f"Query with where filter failed: {e}. Retrying without filter...")
             results = collection.query(
                 query_texts=[query],
                 n_results=n_results,
             )
 
-            retrieved: List[Dict[str, Any]] = []
-            if results and results.get("documents") and len(results["documents"]) > 0:
-                doc_list = results["documents"][0]
-                meta_list = results["metadatas"][0] if results.get("metadatas") else []
-                id_list = results["ids"][0] if results.get("ids") else []
+        retrieved: List[Dict[str, Any]] = []
+        if results and results.get("documents") and len(results["documents"]) > 0:
+            doc_list = results["documents"][0]
+            meta_list = results.get("metadatas", [[]])[0]
+            id_list = results.get("ids", [[]])[0]
 
-                for i, doc in enumerate(doc_list):
-                    meta = meta_list[i] if i < len(meta_list) else {}
-                    c_id = id_list[i] if i < len(id_list) else f"chunk_{i+1}"
-                    retrieved.append(
-                        {
-                            "chunk_id": c_id,
-                            "content": doc,
-                            "start_line": meta.get("start_line", 1),
-                            "end_line": meta.get("end_line", 1),
-                            "language": meta.get("language", "python"),
-                            "metadata": meta,
-                        }
-                    )
+            for i, doc in enumerate(doc_list):
+                meta = meta_list[i] if i < len(meta_list) else {}
+                c_id = id_list[i] if i < len(id_list) else f"chunk_{i+1}"
+                retrieved.append(
+                    {
+                        "chunk_id": c_id,
+                        "content": doc,
+                        "file_path": meta.get("file_path", ""),
+                        "programming_language": meta.get("programming_language", "text"),
+                        "start_line": meta.get("start_line", 1),
+                        "end_line": meta.get("end_line", 1),
+                        "repository": meta.get("repository", ""),
+                    }
+                )
 
-            # Sort retrieved chunks by their starting line number for logical reading
-            retrieved.sort(key=lambda x: x["start_line"])
-            return retrieved if retrieved else chunks[:n_results]
+        return retrieved
 
-        finally:
-            # Clean up temporary collection
-            try:
-                self.client.delete_collection(name=collection_id)
-            except Exception:
-                pass
+    def get_chunk_count(self, repo_id: int) -> int:
+        """Get total number of chunks stored in ChromaDB for a repository."""
+        collection_name = self._get_collection_name(repo_id)
+        try:
+            collection = self.client.get_collection(
+                name=collection_name,
+                embedding_function=self.ef,
+            )
+            return collection.count()
+        except Exception:
+            return 0
+
+    def delete_repository_collection(self, repo_id: int) -> None:
+        """Delete ChromaDB collection for a repository."""
+        collection_name = self._get_collection_name(repo_id)
+        try:
+            self.client.delete_collection(name=collection_name)
+        except Exception:
+            pass
 
     @staticmethod
-    def build_context_prompt(
-        code: str,
-        retrieved_chunks: List[Dict[str, Any]],
-        language: str,
-    ) -> str:
-        """Construct the retrieved RAG context block for prompt injection."""
+    def build_context_prompt(retrieved_chunks: List[Dict[str, Any]]) -> str:
+        """Build formatted code context block for Ollama."""
+        if not retrieved_chunks:
+            return "No specific code chunks retrieved from repository."
+
         context_parts = []
         for i, chunk in enumerate(retrieved_chunks, 1):
+            file_p = chunk.get("file_path", "unknown")
+            s_line = chunk.get("start_line", 1)
+            e_line = chunk.get("end_line", 1)
+            lang = chunk.get("programming_language", "")
             context_parts.append(
-                f"--- [Code Chunk {i} | Lines {chunk['start_line']}-{chunk['end_line']}] ---\n"
-                f"{chunk['content']}\n"
+                f"### [Reference {i}: {file_p} (Lines {s_line}-{e_line})]\n"
+                f"```{lang}\n{chunk['content']}\n```"
             )
-        return "\n".join(context_parts)
+        return "\n\n".join(context_parts)
 
 
 rag_service = RAGService()

@@ -1,9 +1,9 @@
-"""Ollama LLM Service for Code Explanation, Debugging, and Q&A."""
+"""Ollama LLM Service for Code Explanation and Debugging."""
 
-import json
 from typing import Dict, Any, Optional
 import httpx
 from fastapi import HTTPException
+from loguru import logger
 from app.config import settings
 
 
@@ -11,9 +11,9 @@ class OllamaService:
     """Manages communication with the local Ollama LLM instance."""
 
     def __init__(self):
-        self.base_url = settings.OLLAMA_BASE_URL.rstrip("/")
-        self.model = settings.OLLAMA_MODEL
-        self.timeout = settings.OLLAMA_TIMEOUT_SECONDS
+        self.base_url = settings.ollama_base_url.rstrip("/")
+        self.model = settings.ollama_model
+        self.timeout = settings.ollama_timeout_seconds
 
     async def check_health(self) -> Dict[str, Any]:
         """Check if Ollama is running and retrieve available models."""
@@ -23,132 +23,116 @@ class OllamaService:
                 if res.status_code == 200:
                     data = res.json()
                     models = [m.get("name") for m in data.get("models", [])]
+                    model_found = any(self.model in m or m in self.model for m in models)
                     return {
                         "available": True,
-                        "model": self.model,
+                        "configured_model": self.model,
                         "base_url": self.base_url,
                         "available_models": models,
+                        "model_ready": model_found,
                     }
                 return {
                     "available": False,
-                    "model": self.model,
+                    "configured_model": self.model,
                     "base_url": self.base_url,
                     "error": f"Ollama returned HTTP status {res.status_code}",
                 }
         except httpx.ConnectError:
             return {
                 "available": False,
-                "model": self.model,
+                "configured_model": self.model,
                 "base_url": self.base_url,
-                "error": "Cannot connect to Ollama. Make sure 'ollama serve' is running at "
-                + self.base_url,
+                "error": f"Cannot connect to Ollama at {self.base_url}. Please start Ollama.",
             }
         except Exception as e:
             return {
                 "available": False,
-                "model": self.model,
+                "configured_model": self.model,
                 "base_url": self.base_url,
                 "error": str(e),
             }
 
-    def build_prompt(
+    def build_explain_prompt(
         self,
-        code: str,
-        language: str,
-        mode: str,
-        question: Optional[str],
+        file_path: str,
+        code_content: str,
+        question: str,
         rag_context: str,
     ) -> str:
-        """Construct a structured prompt based on the requested mode and RAG context."""
-        mode_lower = mode.lower().strip()
+        """Construct prompt for Code Explanation."""
+        user_question = question.strip() if question and question.strip() else "Explain this code in detail."
 
-        if mode_lower == "explain":
-            return f"""You are an expert software developer and code explanation tutor.
-Explain the following {language} code clearly for beginners and developers.
-
-### RETRIEVED RELEVANT CODE CONTEXT (RAG):
-{rag_context}
-
-### FULL CODE:
-```{language}
-{code}
-```
-
-Please structure your explanation using the following format:
-1. **Purpose**: What this code does at a high level.
-2. **How It Works**: Step-by-step walkthrough of the logic.
-3. **Important Functions / Classes**: Key components and their roles.
-4. **Input & Output**: What data is expected and produced.
-5. **Simple Summary**: Key takeaways in plain English.
-"""
-
-        elif mode_lower == "debug":
-            return f"""You are a senior debugging assistant and software engineer.
-Analyze the following {language} code to identify bugs, syntax issues, runtime errors, and logical mistakes.
-
-### RETRIEVED RELEVANT CODE CONTEXT (RAG):
-{rag_context}
-
-### FULL CODE:
-```{language}
-{code}
-```
-
-Provide your debugging analysis strictly in this structured format:
-
-### Problem:
-[Describe the bug, syntax error, or logical issue clearly]
-
-### Why it happens:
-[Explain the underlying root cause]
-
-### Suggested fix:
-[Explain how to resolve the issue]
-
-### Corrected code:
-```{language}
-[Provide the complete corrected code]
-```
-"""
-
-        else:  # "ask" mode
-            user_q = question if question else "Explain how this code works."
-            return f"""You are an AI code assistant. Answer the user's question accurately based on the provided {language} code and retrieved context.
+        return f"""You are an expert AI Code Explanation Tutor.
+You are explaining code from the repository file: `{file_path}`.
 
 ### USER QUESTION:
-{user_q}
+{user_question}
 
-### RETRIEVED RELEVANT CODE CONTEXT (RAG):
+### RETRIEVED RELEVANT CODE CONTEXT (RAG from Repository):
 {rag_context}
 
-### FULL CODE:
-```{language}
-{code}
+### CURRENT SELECTED FILE CODE (`{file_path}`):
+```
+{code_content}
 ```
 
-Provide a direct, concise, and helpful answer to the user's question, citing specific functions, lines, or logic where appropriate."""
+Please provide a clear and structured explanation containing:
+1. **What the code does** (High-level summary)
+2. **Important functions/classes** (Key components and their roles)
+3. **Main logic** (Step-by-step logic flow)
+4. **Inputs** (Expected input parameters, data types, environment)
+5. **Outputs** (Return values, produced side effects)
+6. **Simple explanation** (Plain-English takeaway for easy understanding)
 
-    async def generate_response(
+Format your response cleanly with clear headings."""
+
+    def build_debug_prompt(
         self,
-        code: str,
-        language: str,
-        mode: str,
-        question: Optional[str],
+        file_path: str,
+        code_content: str,
+        user_query: str,
         rag_context: str,
     ) -> str:
+        """Construct prompt for Debugger Bot."""
+        debug_question = user_query.strip() if user_query and user_query.strip() else "Find errors and bugs in this code and provide a fix."
+
+        return f"""You are an expert AI Software Debugger Bot.
+Analyze the provided code from `{file_path}` along with the repository context to identify bugs, exceptions, syntax issues, or logic failures.
+
+### USER DEBUG QUERY:
+{debug_question}
+
+### RETRIEVED RELEVANT CODE CONTEXT (RAG from Repository):
+{rag_context}
+
+### TARGET FILE CODE (`{file_path}`):
+```
+{code_content}
+```
+
+IMPORTANT: Do not claim code was executed unless execution results are explicitly provided. Analyze the code logically.
+
+Provide your debugging analysis strictly following this format:
+
+### Problem:
+[Describe the bug, error, or failure in detail]
+
+### Reason:
+[Explain why this error occurs and root cause in the code/logic]
+
+### Suggested Fix:
+[Explain step-by-step how to resolve the issue]
+
+### Corrected Code:
+```
+[Provide the complete corrected code]
+```"""
+
+    async def generate_response(self, prompt: str) -> str:
         """Send prompt to local Ollama and return the generated answer."""
-        prompt = self.build_prompt(code, language, mode, question, rag_context)
-
-        system_instruction = (
-            "You are a helpful and accurate AI Code Explanation & Debugger Bot. "
-            "Base your answer strictly on the provided code and retrieved context. "
-            "Format your answer with clean Markdown headings, lists, and code blocks."
-        )
-
         payload = {
             "model": self.model,
             "prompt": prompt,
-            "system": system_instruction,
             "stream": False,
             "options": {
                 "temperature": 0.2,
@@ -168,14 +152,14 @@ Provide a direct, concise, and helpful answer to the user's question, citing spe
                         status_code=404,
                         detail=(
                             f"Model '{self.model}' not found in Ollama. "
-                            f"Please run 'ollama pull {self.model}' or configure OLLAMA_MODEL in .env."
+                            f"Please run 'ollama pull {self.model}' or update OLLAMA_MODEL."
                         ),
                     )
 
                 if res.status_code != 200:
                     raise HTTPException(
                         status_code=502,
-                        detail=f"Ollama server returned error (HTTP {res.status_code}): {res.text}",
+                        detail=f"Ollama returned HTTP {res.status_code}: {res.text}",
                     )
 
                 data = res.json()
@@ -183,32 +167,26 @@ Provide a direct, concise, and helpful answer to the user's question, citing spe
                 if not response_text:
                     raise HTTPException(
                         status_code=500,
-                        detail="Ollama returned an empty response. Please try again.",
+                        detail="Ollama returned an empty response.",
                     )
                 return response_text
 
         except httpx.ConnectError:
             raise HTTPException(
                 status_code=503,
-                detail=(
-                    f"Ollama is unavailable at {self.base_url}. "
-                    f"Please ensure Ollama is installed and running locally with 'ollama serve'."
-                ),
+                detail=f"Ollama is unavailable at {self.base_url}. Please ensure Ollama is running.",
             )
         except httpx.TimeoutException:
             raise HTTPException(
                 status_code=504,
-                detail=(
-                    f"Ollama timed out after {self.timeout}s while generating response. "
-                    f"Consider using a smaller model or reducing input size."
-                ),
+                detail=f"Ollama timed out after {self.timeout}s while generating response.",
             )
         except HTTPException:
             raise
         except Exception as e:
             raise HTTPException(
                 status_code=500,
-                detail=f"Failed to communicate with Ollama: {str(e)}",
+                detail=f"Ollama error: {str(e)}",
             )
 
 
