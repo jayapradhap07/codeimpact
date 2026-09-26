@@ -48,20 +48,23 @@ backend/
 Copy `.env.example` to `.env` and set:
 
 ```env
-# Server
+# Server & App
+APP_NAME=AI Code Explanation & Debugger Bot
 PORT=8000
-ENVIRONMENT=development
+APP_ENV=development
+DEBUG=false
+
+# Database
+DATABASE_URL=sqlite+aiosqlite:///./data/coderag.db
+
+# Ollama Configuration
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_MODEL=qwen2.5-coder:3b
+OLLAMA_TIMEOUT_SECONDS=240.0
 
 # Storage
-DB_PATH=data/codeimpact.db
-VECTOR_STORAGE_DIR=data/vectors
-REPOS_STORAGE_DIR=data/repositories
-
-# AI / LLM Configuration
-LLM_PROVIDER=openai # or gemini / ollama
-OPENAI_API_KEY=your-key-here
-GEMINI_API_KEY=your-key-here
-OLLAMA_BASE_URL=http://localhost:11434
+CHROMA_PERSIST_DIR=./data/chroma_data
+REPO_STORAGE_PATH=./data/repos
 ```
 
 ## Running Tests
