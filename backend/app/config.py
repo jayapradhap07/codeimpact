@@ -27,7 +27,7 @@ class Settings(BaseSettings):
 
     # Ollama Configuration (Local ONLY)
     ollama_base_url: str = "http://localhost:11434"
-    ollama_model: str = "qwen2.5-coder:7b"
+    ollama_model: str = "qwen2.5-coder:3b"
     ollama_timeout_seconds: float = 240.0
 
     # ChromaDB & RAG Storage
